@@ -1,23 +1,31 @@
 import unittest
+import csv
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 
 from galaxian_neuroevolution import (
     Agente,
     carregar_agente,
+    carregar_checkpoint,
+    ConfiguracaoExperimento,
     criar_populacao,
     avaliar,
+    avaliar_detalhado,
     mutar,
     nova_geracao,
+    executar_experimento,
+    salvar_resumo_experimento,
     selecionar,
+    salvar_checkpoint,
 )
 
 
 class AmbienteSimulado:
     def __init__(self):
-        self.action_space = type("Espaco", (), {"n": 3})()
+        self.action_space = EspacoSimulado()
         self.passos = 0
 
     def reset(self, seed=None):
@@ -28,6 +36,19 @@ class AmbienteSimulado:
         self.passos += 1
         terminou = self.passos == 2
         return np.zeros(128, dtype=np.uint8), 1.5, terminou, False, {}
+
+    def close(self):
+        pass
+
+
+class EspacoSimulado:
+    n = 3
+
+    def seed(self, seed):
+        self.rng = np.random.default_rng(seed)
+
+    def sample(self):
+        return int(self.rng.integers(self.n))
 
 
 class TesteNeuroevolucao(unittest.TestCase):
@@ -75,6 +96,135 @@ class TesteNeuroevolucao(unittest.TestCase):
         fitness = avaliar(agente, env, seed=10, max_passos=10)
         self.assertEqual(fitness, 3.0)
         self.assertEqual(env.passos, 2)
+
+    def test_avaliacao_detalhada_registra_fim_de_episodio(self):
+        agente = Agente(3, self.rng)
+        resultado = avaliar_detalhado(agente, AmbienteSimulado(), 10, 10)
+        self.assertEqual(resultado.recompensa, 3.0)
+        self.assertEqual(resultado.passos, 2)
+        self.assertTrue(resultado.terminated)
+        self.assertFalse(resultado.truncated)
+        self.assertFalse(resultado.limite_atingido)
+
+    def test_avaliacao_detalhada_identifica_limite_de_passos(self):
+        class AmbienteSemFim(AmbienteSimulado):
+            def step(self, acao):
+                self.passos += 1
+                return np.zeros(128, dtype=np.uint8), 1.0, False, False, {}
+
+        resultado = avaliar_detalhado(
+            Agente(3, self.rng), AmbienteSemFim(), 10, max_passos=1
+        )
+        self.assertEqual(resultado.passos, 1)
+        self.assertFalse(resultado.terminated)
+        self.assertFalse(resultado.truncated)
+        self.assertTrue(resultado.limite_atingido)
+
+    def test_checkpoint_restaura_populacao_historico_e_rng(self):
+        populacao = criar_populacao(3, self.rng, tamanho=2)
+        melhor = populacao[0]
+        historico = [{"geracao": 0, "melhor": 1.0, "media": 0.5, "pior": 0.0}]
+        registros = [{"tipo": "treino", "seed": 7}]
+        metadados = {"seed": 7, "experimento": "A"}
+        estado_rng = self.rng.bit_generator.state
+
+        with tempfile.TemporaryDirectory() as pasta:
+            caminho = Path(pasta) / "checkpoint.npz"
+            salvar_checkpoint(
+                caminho,
+                populacao,
+                melhor,
+                1,
+                historico,
+                registros,
+                self.rng,
+                metadados,
+            )
+            rng_restaurado = np.random.default_rng(0)
+            carregada, melhor_carregado, proxima, hist, regs = carregar_checkpoint(
+                caminho, 3, rng_restaurado, metadados
+            )
+
+        self.assertEqual(proxima, 1)
+        self.assertEqual(hist, historico)
+        self.assertEqual(regs, registros)
+        self.assertEqual(rng_restaurado.bit_generator.state, estado_rng)
+        np.testing.assert_array_equal(carregada[1].W1, populacao[1].W1)
+        np.testing.assert_array_equal(melhor_carregado.W2, melhor.W2)
+
+    def test_experimento_curto_registra_episodios_e_pode_ser_retomado(self):
+        def criar_env(**_kwargs):
+            return AmbienteSimulado()
+
+        with tempfile.TemporaryDirectory() as pasta:
+            with patch("galaxian_neuroevolution.criar_ambiente", criar_env):
+                primeira = executar_experimento(
+                    configuracao=ConfiguracaoExperimento("A", 0.01, 0.05),
+                    geracoes=1,
+                    tamanho_populacao=2,
+                    seed=11,
+                    max_passos=5,
+                    episodios_avaliacao=2,
+                    pasta_saida=Path(pasta),
+                    renderizar_melhor=False,
+                    retomar=False,
+                )
+                retomada = executar_experimento(
+                    configuracao=ConfiguracaoExperimento("A", 0.01, 0.05),
+                    geracoes=2,
+                    tamanho_populacao=2,
+                    seed=11,
+                    max_passos=5,
+                    episodios_avaliacao=2,
+                    pasta_saida=Path(pasta),
+                    renderizar_melhor=False,
+                    retomar=True,
+                )
+            episodios = (
+                Path(pasta) / "episodios_A_seed_11.csv"
+            ).read_text(encoding="utf-8")
+            with (Path(pasta) / "episodios_A_seed_11.csv").open(
+                newline="", encoding="utf-8"
+            ) as arquivo:
+                linhas_episodios = list(csv.DictReader(arquivo))
+
+        self.assertEqual(len(primeira["historico"]), 1)
+        self.assertEqual(len(retomada["historico"]), 2)
+        self.assertIn("limite_atingido", episodios)
+        self.assertIn("validacao", episodios)
+        self.assertIn("aleatorio", episodios)
+        self.assertEqual(len(linhas_episodios), 8)
+
+    def test_resumo_agrega_media_e_desvio_entre_sementes(self):
+        execucoes = [
+            {
+                "historico": [{"geracao": 0, "melhor": 2, "media": 1, "pior": 0}],
+                "melhor_fitness": 2,
+                "fitness_validacao": 2,
+                "fitness_aleatorio": 1,
+                "passos_validacao": 3,
+                "taxa_limite_validacao": 0,
+            },
+            {
+                "historico": [{"geracao": 0, "melhor": 4, "media": 2, "pior": 1}],
+                "melhor_fitness": 4,
+                "fitness_validacao": 4,
+                "fitness_aleatorio": 2,
+                "passos_validacao": 5,
+                "taxa_limite_validacao": 1,
+            },
+        ]
+        with tempfile.TemporaryDirectory() as pasta:
+            resumo = salvar_resumo_experimento("A", execucoes, Path(pasta))
+            with (Path(pasta) / "resumo_geracoes_A.csv").open(
+                newline="", encoding="utf-8"
+            ) as arquivo:
+                geracao = next(csv.DictReader(arquivo))
+
+        self.assertEqual(resumo["melhor_fitness_media"], 3.0)
+        self.assertEqual(resumo["fitness_validacao_desvio_padrao"], 1.0)
+        self.assertEqual(float(geracao["melhor_media"]), 3.0)
+        self.assertEqual(float(geracao["melhor_desvio_padrao"]), 1.0)
 
     def test_selecao_prioriza_maior_fitness(self):
         populacao = criar_populacao(3, self.rng, tamanho=8)

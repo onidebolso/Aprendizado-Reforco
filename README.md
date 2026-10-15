@@ -67,6 +67,20 @@ Comparar os tres cenarios de mutacao em sequencia:
 python galaxian_neuroevolution.py --experimento all
 ```
 
+Rodar cada cenario cinco vezes, usando sementes consecutivas a partir da
+semente base 42:
+
+```powershell
+python galaxian_neuroevolution.py --experimento all --repeticoes 5 --seed 42
+```
+
+Por padrao, ao final de cada treino o melhor agente e avaliado em cinco
+episodios com sementes reservadas para validacao. Para alterar essa quantidade:
+
+```powershell
+python galaxian_neuroevolution.py --experimento B --repeticoes 5 --episodios-avaliacao 10
+```
+
 Executar um cenario especifico:
 
 ```powershell
@@ -80,6 +94,19 @@ Fazer uma execucao curta para teste ou demonstracao:
 ```powershell
 python galaxian_neuroevolution.py --experimento B --geracoes 3 --populacao 4 --max-passos 500 --renderizar-melhor
 ```
+
+Continuar um experimento interrompido, mantendo a mesma semente, populacao e
+limite de passos do treino original:
+
+```powershell
+python galaxian_neuroevolution.py --experimento B --repeticoes 5 --geracoes 50 --retomar
+```
+
+`--geracoes` indica o total desejado, nao um numero adicional. Por exemplo,
+retomar um treino de 30 geracoes com `--geracoes 50` executa as 20 restantes.
+Os checkpoints ficam em `resultados\checkpoints\`. Cada combinacao de
+experimento e semente tem seu proprio arquivo; sem `--retomar`, o treino comeca
+novamente do zero.
 
 Assistir ao melhor agente de um treino salvo, sem treinar novamente:
 
@@ -110,13 +137,17 @@ python -m unittest -v test_galaxian_neuroevolution.py
 ```
 
 Opcoes: `--experimento A|B|C|all`, `--geracoes`, `--populacao`, `--seed`,
-`--max-passos`, `--saida`, `--renderizar-melhor`, `--assistir` e `--episodios`.
+`--repeticoes`, `--episodios-avaliacao`, `--max-passos`, `--saida`, `--retomar`,
+`--renderizar-melhor`, `--assistir` e `--episodios`.
 Os valores padrao sao: experimento B, 30 geracoes, populacao de 20 individuos,
-semente 42, ate 5.000 passos por episodio e pasta de saida `resultados/`.
-Use `--seed` para repetir ou variar a semente, `--saida` para escolher outra
-pasta de resultados e `--max-passos` para alterar o limite de passos. Uma
-populacao maior, mais geracoes ou episodios mais longos aumentam o tempo de
-execucao.
+semente base 42, uma repeticao, cinco episodios de validacao, ate 5.000 passos
+por episodio e pasta de saida `resultados/`. Cada repeticao avanca a semente
+base em uma unidade. As sementes de validacao sao separadas das usadas no
+treino e o agente e a politica aleatoria recebem as mesmas sementes de
+validacao para comparacao pareada. Use `--seed` para escolher a semente base,
+`--saida` para escolher outra pasta e `--max-passos` para alterar o limite.
+Uma populacao maior, mais geracoes, repeticoes ou episodios mais longos
+aumentam o tempo de execucao.
 
 ## O que o programa implementa
 
@@ -130,15 +161,30 @@ execucao.
   copia sem alteracao dos dois melhores (elitismo) e filhos criados por copia
   independente de um pai, seguida de mutacao gaussiana dos pesos e vieses.
 - Fitness melhor, medio e pior registrados para cada geracao.
-- Baseline aleatorio executado para comparacao com o melhor individuo evoluido.
+- Avaliacao do melhor agente apos o treino em episodios separados, comparada
+  com uma politica aleatoria nas mesmas sementes.
+- Checkpoint por experimento e semente, com estado da populacao, historico e
+  gerador aleatorio para permitir retomada reprodutivel.
 
 ## Arquivos gerados
 
-Na pasta `resultados/`, cada experimento salva:
+Na pasta `resultados/`, o programa salva:
 
-- `experimento_X.csv`: fitness melhor, medio e pior por geracao;
-- `experimento_X.png`: grafico do melhor e do fitness medio;
-- `melhor_agente_X.npz`: pesos e vieses do melhor agente encontrado.
+- `resultados_por_semente.csv`: fitness de treino, validacao e baseline por
+  repeticao, com passos medios e taxa de episodios que atingiram o limite;
+- `resumo_experimentos.csv`: media e desvio-padrao das repeticoes por cenario;
+- `resumo_geracoes_X.csv`: media e desvio-padrao do melhor, medio e pior
+  fitness de cada geracao entre as repeticoes;
+- `experimento_X.png`: curvas agregadas por geracao; a faixa sombreada mostra
+  o desvio-padrao do melhor fitness;
+- `experimento_X_seed_N.csv`: fitness melhor, medio e pior por geracao e
+  semente;
+- `episodios_X_seed_N.csv`: tipo de episodio (treino, validacao ou aleatorio),
+  recompensa, passos, flags `terminated`/`truncated` e indicacao de limite;
+- `melhor_agente_X_seed_N.npz`: pesos do melhor agente de cada repeticao.
+  `melhor_agente_X.npz` e uma copia do agente com maior media de validacao;
+- `checkpoints/experimento_X_seed_N.npz`: estado necessario para retomar cada
+  repeticao.
 
 ## Como explicar e analisar
 
@@ -146,6 +192,9 @@ Na pasta `resultados/`, cada experimento salva:
 usada para comparar individuos e, neste projeto, corresponde a soma das
 recompensas de um episodio. Todos os individuos de uma geracao usam a mesma
 semente para reduzir diferencas causadas pela aleatoriedade do ambiente.
+`terminated` indica o fim natural do episodio, `truncated` indica uma
+interrupcao do ambiente e `limite_atingido` marca episodios que chegam ao
+numero maximo de passos configurado.
 
 A exploracao vem dos pesos iniciais aleatorios e das mutacoes. No cenario A,
 as mudancas pequenas podem manter comportamentos bons, mas explorar lentamente.
@@ -154,8 +203,8 @@ destruir parametros uteis. O grafico e o CSV permitem observar se o melhor e o
 fitness medio continuam subindo ou se estabilizam (convergencia). Compare
 tambem o melhor fitness evoluido com o baseline aleatorio.
 
-Ao executar `--experimento all`, os tres cenarios usam a mesma semente para
-partir dos mesmos pesos iniciais e sequencias de ambiente. Os resultados de uma
-unica execucao ainda podem variar. Para uma conclusao mais confiavel, rode os
-cenarios mais de uma vez mudando `--seed` e compare as curvas, sem esquecer de
-informar esse procedimento no relatorio.
+Ao executar `--experimento all`, os tres cenarios usam as mesmas sementes e
+inicializacoes correspondentes para facilitar a comparacao. As medias e os
+desvios-padrao descrevem a variacao entre repeticoes; compare tambem o fitness
+medio de validacao com o baseline, sem confundir o desempenho de treino com o
+resultado em sementes reservadas.

@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import copy
 import csv
+import json
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import ale_py
 import gymnasium as gym
@@ -23,6 +25,9 @@ TAXA_MUTACAO = 0.10
 INTENSIDADE_MUTACAO = 0.20
 NUM_ELITE = 2
 MAX_PASSOS_EPISODIO = 5_000
+STREAM_TREINO = 0
+STREAM_VALIDACAO = 1
+STREAM_EXIBICAO = 2
 
 gym.register_envs(ale_py)
 
@@ -34,11 +39,30 @@ class ConfiguracaoExperimento:
     intensidade_mutacao: float
 
 
+@dataclass(frozen=True)
+class ResultadoEpisodio:
+    recompensa: float
+    passos: int
+    terminated: bool
+    truncated: bool
+    limite_atingido: bool
+
+
 EXPERIMENTOS = {
     "A": ConfiguracaoExperimento("A", 0.01, 0.05),
     "B": ConfiguracaoExperimento("B", TAXA_MUTACAO, INTENSIDADE_MUTACAO),
     "C": ConfiguracaoExperimento("C", 0.40, 0.50),
 }
+
+
+def derivar_seed(seed: int, stream: int, indice: int) -> int:
+    """Gera sementes deterministicas separadas por execucao, fluxo e episodio."""
+    valor = int(
+        np.random.SeedSequence([seed, stream, indice]).generate_state(
+            1, dtype=np.uint32
+        )[0]
+    )
+    return valor % (2**31 - 1)
 
 
 def criar_ambiente(
@@ -76,6 +100,47 @@ class Agente:
         return int(np.argmax(saida))
 
 
+def executar_episodio(
+    escolher_acao: Callable[[np.ndarray], int],
+    env,
+    seed: int,
+    max_passos: int = MAX_PASSOS_EPISODIO,
+) -> ResultadoEpisodio:
+    if max_passos < 1:
+        raise ValueError("max_passos deve ser pelo menos 1.")
+    estado, _ = env.reset(seed=seed)
+    recompensa_total = 0.0
+    terminated = False
+    truncated = False
+    passos = 0
+
+    for _ in range(max_passos):
+        acao = escolher_acao(estado)
+        estado, recompensa, terminated, truncated, _ = env.step(acao)
+        passos += 1
+        recompensa_total += float(recompensa)
+        if terminated or truncated:
+            break
+
+    return ResultadoEpisodio(
+        recompensa=recompensa_total,
+        passos=passos,
+        terminated=bool(terminated),
+        truncated=bool(truncated),
+        limite_atingido=passos == max_passos and not terminated,
+    )
+
+
+def avaliar_detalhado(
+    agente: Agente,
+    env,
+    seed: int,
+    max_passos: int = MAX_PASSOS_EPISODIO,
+) -> ResultadoEpisodio:
+    """Executa um episodio e retorna recompensa e motivo de encerramento."""
+    return executar_episodio(agente.agir, env, seed, max_passos)
+
+
 def avaliar(
     agente: Agente,
     env,
@@ -83,37 +148,24 @@ def avaliar(
     max_passos: int = MAX_PASSOS_EPISODIO,
 ) -> float:
     """Executa um episodio e retorna a soma das recompensas como fitness."""
-    if max_passos < 1:
-        raise ValueError("max_passos deve ser pelo menos 1.")
-    estado, _ = env.reset(seed=seed)
-    recompensa_total = 0.0
-
-    for _ in range(max_passos):
-        acao = agente.agir(estado)
-        estado, recompensa, terminated, truncated, _ = env.step(acao)
-        recompensa_total += float(recompensa)
-        if terminated or truncated:
-            break
-
-    return recompensa_total
+    return avaliar_detalhado(agente, env, seed, max_passos).recompensa
 
 
 def avaliar_aleatorio(env, seed: int, max_passos: int = MAX_PASSOS_EPISODIO) -> float:
     """Executa o baseline que escolhe uniformemente entre as acoes disponiveis."""
+    return avaliar_aleatorio_detalhado(env, seed, max_passos).recompensa
+
+
+def avaliar_aleatorio_detalhado(
+    env, seed: int, max_passos: int = MAX_PASSOS_EPISODIO
+) -> ResultadoEpisodio:
+    """Executa um episodio aleatorio e retorna metricas de encerramento."""
     if max_passos < 1:
         raise ValueError("max_passos deve ser pelo menos 1.")
     env.action_space.seed(seed)
-    estado, _ = env.reset(seed=seed)
-    recompensa_total = 0.0
-
-    for _ in range(max_passos):
-        acao = env.action_space.sample()
-        estado, recompensa, terminated, truncated, _ = env.step(acao)
-        recompensa_total += float(recompensa)
-        if terminated or truncated:
-            break
-
-    return recompensa_total
+    return executar_episodio(
+        lambda _estado: env.action_space.sample(), env, seed, max_passos
+    )
 
 
 def criar_populacao(
@@ -185,43 +237,190 @@ def nova_geracao(
     return proxima
 
 
-def salvar_resultados(
-    historico: list[dict[str, float | int]],
-    melhor_agente: Agente,
-    pasta: Path,
-    nome: str,
-) -> None:
-    pasta.mkdir(parents=True, exist_ok=True)
-    caminho_csv = pasta / f"experimento_{nome}.csv"
-    with caminho_csv.open("w", newline="", encoding="utf-8") as arquivo:
-        campos = ("geracao", "melhor", "media", "pior")
+def salvar_agente(agente: Agente, caminho: Path) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    np.savez(
+        caminho,
+        W1=agente.W1,
+        b1=agente.b1,
+        W2=agente.W2,
+        b2=agente.b2,
+        fitness=agente.fitness,
+    )
+
+
+def gravar_csv(caminho: Path, campos: tuple[str, ...], linhas: list[dict]) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    with caminho.open("w", newline="", encoding="utf-8") as arquivo:
         escritor = csv.DictWriter(arquivo, fieldnames=campos)
         escritor.writeheader()
-        escritor.writerows(historico)
+        escritor.writerows(linhas)
 
-    geracoes = [int(item["geracao"]) for item in historico]
-    melhores = [float(item["melhor"]) for item in historico]
-    medias = [float(item["media"]) for item in historico]
-    plt.figure()
-    plt.plot(geracoes, melhores, label="Melhor fitness")
-    plt.plot(geracoes, medias, label="Fitness medio")
-    plt.xlabel("Geracao")
-    plt.ylabel("Fitness (soma das recompensas)")
-    plt.title(f"Evolucao - Experimento {nome}")
-    plt.grid(True, alpha=0.3)
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(pasta / f"experimento_{nome}.png", dpi=150)
-    plt.close()
 
-    np.savez(
-        pasta / f"melhor_agente_{nome}.npz",
-        W1=melhor_agente.W1,
-        b1=melhor_agente.b1,
-        W2=melhor_agente.W2,
-        b2=melhor_agente.b2,
-        fitness=melhor_agente.fitness,
+def registrar_episodio(
+    registros: list[dict],
+    tipo: str,
+    resultado: ResultadoEpisodio,
+    seed: int,
+    geracao: int | None = None,
+    individuo: int | None = None,
+    episodio: int | None = None,
+) -> None:
+    registros.append(
+        {
+            "tipo": tipo,
+            "geracao": geracao,
+            "individuo": individuo,
+            "episodio": episodio,
+            "seed": seed,
+            "recompensa": resultado.recompensa,
+            "passos": resultado.passos,
+            "terminated": resultado.terminated,
+            "truncated": resultado.truncated,
+            "limite_atingido": resultado.limite_atingido,
+        }
     )
+
+
+def salvar_checkpoint(
+    caminho: Path,
+    populacao: list[Agente],
+    melhor_global: Agente,
+    proxima_geracao: int,
+    historico: list[dict[str, float | int]],
+    registros: list[dict],
+    rng: np.random.Generator,
+    metadados: dict,
+) -> None:
+    caminho.parent.mkdir(parents=True, exist_ok=True)
+    temporario = caminho.with_name(f"{caminho.name}.tmp")
+    with temporario.open("wb") as arquivo:
+        np.savez_compressed(
+            arquivo,
+            W1=np.stack([agente.W1 for agente in populacao]),
+            b1=np.stack([agente.b1 for agente in populacao]),
+            W2=np.stack([agente.W2 for agente in populacao]),
+            b2=np.stack([agente.b2 for agente in populacao]),
+            fitness=np.asarray([agente.fitness for agente in populacao]),
+            melhor_W1=melhor_global.W1,
+            melhor_b1=melhor_global.b1,
+            melhor_W2=melhor_global.W2,
+            melhor_b2=melhor_global.b2,
+            melhor_fitness=melhor_global.fitness,
+            proxima_geracao=proxima_geracao,
+            historico_json=json.dumps(historico),
+            registros_json=json.dumps(registros),
+            rng_json=json.dumps(rng.bit_generator.state),
+            metadados_json=json.dumps(metadados, sort_keys=True),
+        )
+    temporario.replace(caminho)
+
+
+def carregar_checkpoint(
+    caminho: Path,
+    num_acoes: int,
+    rng: np.random.Generator,
+    metadados_esperados: dict,
+) -> tuple[list[Agente], Agente, int, list[dict], list[dict]]:
+    with np.load(caminho, allow_pickle=False) as dados:
+        metadados = json.loads(str(dados["metadados_json"]))
+        if metadados != metadados_esperados:
+            raise ValueError(
+                "O checkpoint nao corresponde a semente, populacao, limite "
+                "de passos ou configuracao deste experimento."
+            )
+        populacao = []
+        for indice in range(len(dados["fitness"])):
+            agente = Agente(num_acoes, rng)
+            for nome in ("W1", "b1", "W2", "b2"):
+                getattr(agente, nome)[:] = dados[nome][indice]
+            agente.fitness = float(dados["fitness"][indice])
+            populacao.append(agente)
+
+        melhor = Agente(num_acoes, rng)
+        for nome in ("W1", "b1", "W2", "b2"):
+            getattr(melhor, nome)[:] = dados[f"melhor_{nome}"]
+        melhor.fitness = float(dados["melhor_fitness"])
+        rng.bit_generator.state = json.loads(str(dados["rng_json"]))
+        return (
+            populacao,
+            melhor,
+            int(dados["proxima_geracao"]),
+            json.loads(str(dados["historico_json"])),
+            json.loads(str(dados["registros_json"])),
+        )
+
+
+def salvar_resumo_experimento(
+    nome: str,
+    execucoes: list[dict],
+    pasta: Path,
+) -> dict:
+    pasta.mkdir(parents=True, exist_ok=True)
+    historicos = [execucao["historico"] for execucao in execucoes]
+    geracoes = range(min(len(historico) for historico in historicos))
+    resumo_geracoes = []
+    for geracao in geracoes:
+        linha: dict[str, float | int] = {"geracao": geracao}
+        for metrica in ("melhor", "media", "pior"):
+            valores = np.asarray(
+                [historico[geracao][metrica] for historico in historicos],
+                dtype=float,
+            )
+            linha[f"{metrica}_media"] = float(np.mean(valores))
+            linha[f"{metrica}_desvio_padrao"] = float(np.std(valores))
+        resumo_geracoes.append(linha)
+    campos_geracoes = (
+        "geracao",
+        "melhor_media",
+        "melhor_desvio_padrao",
+        "media_media",
+        "media_desvio_padrao",
+        "pior_media",
+        "pior_desvio_padrao",
+    )
+    gravar_csv(
+        pasta / f"resumo_geracoes_{nome}.csv",
+        campos_geracoes,
+        resumo_geracoes,
+    )
+
+    metricas = (
+        "melhor_fitness",
+        "fitness_validacao",
+        "fitness_aleatorio",
+        "passos_validacao",
+        "taxa_limite_validacao",
+    )
+    resumo: dict[str, str | int | float] = {
+        "experimento": nome,
+        "repeticoes": len(execucoes),
+    }
+    for metrica in metricas:
+        valores = np.asarray([execucao[metrica] for execucao in execucoes], dtype=float)
+        resumo[f"{metrica}_media"] = float(np.mean(valores))
+        resumo[f"{metrica}_desvio_padrao"] = float(np.std(valores))
+
+    if resumo_geracoes:
+        x = [int(linha["geracao"]) for linha in resumo_geracoes]
+        melhor = np.asarray([linha["melhor_media"] for linha in resumo_geracoes])
+        desvio = np.asarray(
+            [linha["melhor_desvio_padrao"] for linha in resumo_geracoes]
+        )
+        media = [float(linha["media_media"]) for linha in resumo_geracoes]
+        plt.figure()
+        plt.plot(x, melhor, label="Melhor fitness medio entre sementes")
+        plt.fill_between(x, melhor - desvio, melhor + desvio, alpha=0.2)
+        plt.plot(x, media, label="Fitness medio da populacao")
+        plt.xlabel("Geracao")
+        plt.ylabel("Fitness (soma das recompensas)")
+        plt.title(f"Experimento {nome}: media e dispersao")
+        plt.grid(True, alpha=0.3)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(pasta / f"experimento_{nome}.png", dpi=150)
+        plt.close()
+    return resumo
 
 
 def carregar_agente(caminho: Path, num_acoes: int) -> Agente:
@@ -284,28 +483,74 @@ def executar_experimento(
     tamanho_populacao: int,
     seed: int,
     max_passos: int,
+    episodios_avaliacao: int,
     pasta_saida: Path,
     renderizar_melhor: bool,
-) -> tuple[float, float]:
+    retomar: bool,
+) -> dict:
     rng = np.random.default_rng(seed)
     env = criar_ambiente(max_episode_steps=max_passos)
+    nome_execucao = f"{configuracao.nome}_seed_{seed}"
+    caminho_checkpoint = (
+        pasta_saida / "checkpoints" / f"experimento_{nome_execucao}.npz"
+    )
+    metadados = {
+        "experimento": configuracao.nome,
+        "seed": seed,
+        "populacao": tamanho_populacao,
+        "max_passos": max_passos,
+        "taxa_mutacao": configuracao.taxa_mutacao,
+        "intensidade_mutacao": configuracao.intensidade_mutacao,
+    }
     try:
         num_acoes = int(env.action_space.n)
-        populacao = criar_populacao(num_acoes, rng, tamanho_populacao)
-        melhor_global: Agente | None = None
-        historico: list[dict[str, float | int]] = []
+        if retomar:
+            if not caminho_checkpoint.exists():
+                raise FileNotFoundError(
+                    f"Nao foi encontrado checkpoint para retomar: "
+                    f"{caminho_checkpoint}"
+                )
+            (
+                populacao,
+                melhor_global,
+                primeira_geracao,
+                historico,
+                registros,
+            ) = carregar_checkpoint(caminho_checkpoint, num_acoes, rng, metadados)
+            if primeira_geracao > geracoes:
+                raise ValueError(
+                    f"O checkpoint ja alcancou {primeira_geracao} geracoes; "
+                    f"--geracoes deve ser pelo menos esse valor."
+                )
+        else:
+            populacao = criar_populacao(num_acoes, rng, tamanho_populacao)
+            melhor_global = None
+            primeira_geracao = 0
+            historico = []
+            registros = []
         print(
             f"\nExperimento {configuracao.nome}: "
             f"taxa={configuracao.taxa_mutacao:.0%}, "
             f"intensidade={configuracao.intensidade_mutacao:.2f}; "
+            f"seed={seed}; "
             f"acoes disponiveis={num_acoes}"
         )
 
-        for geracao in range(geracoes):
-            for agente in populacao:
+        for geracao in range(primeira_geracao, geracoes):
+            seed_treino = derivar_seed(seed, STREAM_TREINO, geracao)
+            for indice, agente in enumerate(populacao):
                 # Todos os individuos da geracao enfrentam a mesma semente.
-                agente.fitness = avaliar(
-                    agente, env, seed + geracao, max_passos=max_passos
+                resultado = avaliar_detalhado(
+                    agente, env, seed_treino, max_passos=max_passos
+                )
+                agente.fitness = resultado.recompensa
+                registrar_episodio(
+                    registros,
+                    "treino",
+                    resultado,
+                    seed_treino,
+                    geracao=geracao,
+                    individuo=indice,
                 )
                 if melhor_global is None or agente.fitness > melhor_global.fitness:
                     melhor_global = copy.deepcopy(agente)
@@ -327,24 +572,87 @@ def executar_experimento(
                 f"Melhor: {melhor:.2f} | Media: {media:.2f} | Pior: {pior:.2f}"
             )
 
-            if geracao < geracoes - 1:
-                populacao = nova_geracao(
-                    populacao,
-                    rng,
-                    configuracao.taxa_mutacao,
-                    configuracao.intensidade_mutacao,
-                    num_elite=min(NUM_ELITE, len(populacao) - 1),
-                )
+            populacao = nova_geracao(
+                populacao,
+                rng,
+                configuracao.taxa_mutacao,
+                configuracao.intensidade_mutacao,
+                num_elite=min(NUM_ELITE, len(populacao) - 1),
+            )
+            salvar_checkpoint(
+                caminho_checkpoint,
+                populacao,
+                melhor_global,
+                geracao + 1,
+                historico,
+                registros,
+                rng,
+                metadados,
+            )
 
         if melhor_global is None:
             raise RuntimeError("Nenhum individuo foi avaliado.")
 
-        baseline = avaliar_aleatorio(
-            env, seed + geracoes, max_passos=max_passos
+        validacoes = []
+        baselines = []
+        for episodio in range(episodios_avaliacao):
+            seed_validacao = derivar_seed(seed, STREAM_VALIDACAO, episodio)
+            resultado_agente = avaliar_detalhado(
+                melhor_global, env, seed_validacao, max_passos=max_passos
+            )
+            resultado_aleatorio = avaliar_aleatorio_detalhado(
+                env, seed_validacao, max_passos=max_passos
+            )
+            validacoes.append(resultado_agente)
+            baselines.append(resultado_aleatorio)
+            registrar_episodio(
+                registros,
+                "validacao",
+                resultado_agente,
+                seed_validacao,
+                episodio=episodio,
+            )
+            registrar_episodio(
+                registros,
+                "aleatorio",
+                resultado_aleatorio,
+                seed_validacao,
+                episodio=episodio,
+            )
+
+        fitness_validacao = float(np.mean([item.recompensa for item in validacoes]))
+        fitness_aleatorio = float(np.mean([item.recompensa for item in baselines]))
+        passos_validacao = float(np.mean([item.passos for item in validacoes]))
+        taxa_limite = float(np.mean([item.limite_atingido for item in validacoes]))
+        print(f"Fitness medio de validacao: {fitness_validacao:.2f}")
+        print(f"Fitness medio aleatorio: {fitness_aleatorio:.2f}")
+        print(f"Melhor fitness durante treino: {melhor_global.fitness:.2f}")
+
+        pasta_saida.mkdir(parents=True, exist_ok=True)
+        gravar_csv(
+            pasta_saida / f"experimento_{nome_execucao}.csv",
+            ("geracao", "melhor", "media", "pior"),
+            historico,
         )
-        print(f"Baseline aleatorio: {baseline:.2f}")
-        print(f"Melhor agente evoluido: {melhor_global.fitness:.2f}")
-        salvar_resultados(historico, melhor_global, pasta_saida, configuracao.nome)
+        gravar_csv(
+            pasta_saida / f"episodios_{nome_execucao}.csv",
+            (
+                "tipo",
+                "geracao",
+                "individuo",
+                "episodio",
+                "seed",
+                "recompensa",
+                "passos",
+                "terminated",
+                "truncated",
+                "limite_atingido",
+            ),
+            registros,
+        )
+        salvar_agente(
+            melhor_global, pasta_saida / f"melhor_agente_{nome_execucao}.npz"
+        )
 
         if renderizar_melhor:
             env.close()
@@ -352,11 +660,23 @@ def executar_experimento(
                 render_mode="human", max_episode_steps=max_passos
             )
             pontuacao = avaliar(
-                melhor_global, env, seed + geracoes + 1, max_passos=max_passos
+                melhor_global,
+                env,
+                derivar_seed(seed, STREAM_EXIBICAO, 0),
+                max_passos=max_passos,
             )
             print(f"Pontuacao na exibicao do melhor agente: {pontuacao:.2f}")
 
-        return melhor_global.fitness, baseline
+        return {
+            "seed": seed,
+            "historico": historico,
+            "melhor_fitness": melhor_global.fitness,
+            "fitness_validacao": fitness_validacao,
+            "fitness_aleatorio": fitness_aleatorio,
+            "passos_validacao": passos_validacao,
+            "taxa_limite_validacao": taxa_limite,
+            "melhor_agente": melhor_global,
+        }
     finally:
         env.close()
 
@@ -374,8 +694,25 @@ def criar_parser() -> argparse.ArgumentParser:
     parser.add_argument("--geracoes", type=int, default=NUM_GERACOES)
     parser.add_argument("--populacao", type=int, default=TAMANHO_POPULACAO)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--repeticoes",
+        type=int,
+        default=1,
+        help="Numero de execucoes por experimento usando sementes consecutivas.",
+    )
     parser.add_argument("--max-passos", type=int, default=MAX_PASSOS_EPISODIO)
+    parser.add_argument(
+        "--episodios-avaliacao",
+        type=int,
+        default=5,
+        help="Episodios de validacao em sementes reservadas (padrao: 5).",
+    )
     parser.add_argument("--saida", type=Path, default=Path("resultados"))
+    parser.add_argument(
+        "--retomar",
+        action="store_true",
+        help="Continua cada execucao a partir do checkpoint salvo.",
+    )
     parser.add_argument(
         "--assistir",
         type=Path,
@@ -401,6 +738,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.max_passos < 1:
         parser.error("--max-passos deve ser positivo.")
+    if args.seed < 0:
+        parser.error("--seed deve ser nao negativo.")
     if args.assistir is not None:
         if args.episodios < 1:
             parser.error("--episodios deve ser pelo menos 1.")
@@ -408,18 +747,67 @@ def main() -> None:
         return
     if args.geracoes < 1 or args.populacao < 2:
         parser.error("--geracoes deve ser positivo e --populacao deve ser >= 2.")
+    if args.repeticoes < 1 or args.episodios_avaliacao < 1:
+        parser.error("--repeticoes e --episodios-avaliacao devem ser positivos.")
 
     nomes = tuple(EXPERIMENTOS) if args.experimento == "all" else (args.experimento,)
+    resumos = []
+    linhas_execucoes = []
     for nome in nomes:
-        executar_experimento(
-            EXPERIMENTOS[nome],
-            args.geracoes,
-            args.populacao,
-            args.seed,
-            args.max_passos,
-            args.saida,
-            args.renderizar_melhor,
+        execucoes = []
+        for repeticao in range(args.repeticoes):
+            seed = args.seed + repeticao
+            execucao = executar_experimento(
+                EXPERIMENTOS[nome],
+                args.geracoes,
+                args.populacao,
+                seed,
+                args.max_passos,
+                args.episodios_avaliacao,
+                args.saida,
+                args.renderizar_melhor,
+                args.retomar,
+            )
+            execucoes.append(execucao)
+            linha = {
+                campo: execucao[campo]
+                for campo in (
+                    "seed",
+                    "melhor_fitness",
+                    "fitness_validacao",
+                    "fitness_aleatorio",
+                    "passos_validacao",
+                    "taxa_limite_validacao",
+                )
+            }
+            linha["experimento"] = nome
+            linhas_execucoes.append(linha)
+
+        resumos.append(salvar_resumo_experimento(nome, execucoes, args.saida))
+        melhor_execucao = max(execucoes, key=lambda item: item["fitness_validacao"])
+        salvar_agente(
+            melhor_execucao["melhor_agente"],
+            args.saida / f"melhor_agente_{nome}.npz",
         )
+
+    gravar_csv(
+        args.saida / "resumo_experimentos.csv",
+        tuple(resumos[0].keys()),
+        resumos,
+    )
+    gravar_csv(
+        args.saida / "resultados_por_semente.csv",
+        (
+            "experimento",
+            "seed",
+            "melhor_fitness",
+            "fitness_validacao",
+            "fitness_aleatorio",
+            "passos_validacao",
+            "taxa_limite_validacao",
+        ),
+        linhas_execucoes,
+    )
 
 
 if __name__ == "__main__":
