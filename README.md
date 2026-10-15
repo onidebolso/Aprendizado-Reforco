@@ -1,8 +1,27 @@
 # Neuroevolucao aplicada ao Atari Galaxian
 
-Projeto para o trabalho pratico de Fundamentos de Inteligencia Artificial. O
-agente aprende por algoritmo evolutivo: nao usa DQN, Q-Learning, exemplos
-rotulados nem backpropagation.
+Este projeto implementa um agente que aprende a jogar **Atari Galaxian** por
+neuroevolucao. Ele foi desenvolvido para o trabalho pratico de Fundamentos de
+Inteligencia Artificial e demonstra como uma politica de controle pode ser
+otimizada por selecao e mutacao, sem ensinar ao agente a acao correta em cada
+estado.
+
+Em cada episodio, o jogo fornece ao agente uma observacao com 128 valores da
+RAM do Atari. Uma rede neural pequena transforma esses valores em pontuacoes
+para as acoes disponiveis; o agente escolhe a acao de maior pontuacao. A soma
+das recompensas do episodio e o *fitness* usado para comparar os individuos.
+Uma populacao de redes e avaliada, os individuos com melhor fitness sao
+selecionados como pais, e novas geracoes sao criadas a partir de copias com
+mutacoes aleatorias nos pesos e vieses. Os melhores individuos sao preservados
+entre geracoes.
+
+O objetivo e comparar como diferentes taxas e intensidades de mutacao afetam
+o desempenho, observando as curvas de fitness e comparando o melhor agente com
+uma estrategia de acoes aleatorias. O projeto usa Gymnasium e o Atari
+Learning Environment (ALE), com o ambiente `ALE/Galaxian-v5`.
+
+O metodo e uma busca evolutiva sobre os parametros da rede: **nao** usa DQN,
+Q-Learning, exemplos rotulados, gradiente ou backpropagation.
 
 ## Adaptacao do enunciado
 
@@ -13,7 +32,7 @@ diretamente de `env.action_space.n`; assim, a rede pode escolher entre as acoes
 que o ALE disponibiliza para Galaxian, sem supor que sejam apenas `NOOP`, `UP`
 e `DOWN`.
 
-## Preparacao
+## Instalacao e configuracao
 
 Recomendado: Python 3.10 ou mais recente.
 
@@ -26,48 +45,78 @@ python -m pip install -r requirements.txt
 Se a ativacao do ambiente virtual for bloqueada pelo PowerShell, use
 `.\.venv\Scripts\python.exe` no lugar de `python`.
 
-## Executar
+## Comandos de execucao
 
-O experimento B (taxa de mutacao de 10% e intensidade 0,20) e o padrao:
+Os exemplos abaixo usam PowerShell e devem ser executados na pasta do projeto.
+Depois de ativar o ambiente virtual conforme a secao anterior, treine com os
+valores padrao (experimento B, 30 geracoes, populacao de 20 individuos):
 
 ```powershell
 python galaxian_neuroevolution.py
 ```
 
-Comparar os tres cenarios sugeridos no enunciado (A: 1%/0,05; B: 10%/0,20;
-C: 40%/0,50):
+O mesmo comando sem ativar o ambiente virtual:
+
+```powershell
+.\.venv\Scripts\python.exe galaxian_neuroevolution.py
+```
+
+Comparar os tres cenarios de mutacao em sequencia:
 
 ```powershell
 python galaxian_neuroevolution.py --experimento all
 ```
 
-Para uma execucao curta de teste ou demonstracao:
+Executar um cenario especifico:
+
+```powershell
+python galaxian_neuroevolution.py --experimento A
+python galaxian_neuroevolution.py --experimento B
+python galaxian_neuroevolution.py --experimento C
+```
+
+Fazer uma execucao curta para teste ou demonstracao:
 
 ```powershell
 python galaxian_neuroevolution.py --experimento B --geracoes 3 --populacao 4 --max-passos 500 --renderizar-melhor
 ```
 
-Para assistir a um agente que ja foi treinado e salvo, sem treinar novamente:
+Assistir ao melhor agente de um treino salvo, sem treinar novamente:
 
 ```powershell
 python galaxian_neuroevolution.py --assistir resultados\melhor_agente_B.npz
 ```
 
-Para mostrar mais episodios ou definir por quanto tempo o jogo pode rodar:
+Assistir por tres episodios e limitar cada episodio a 5.000 passos:
 
 ```powershell
 python galaxian_neuroevolution.py --assistir resultados\melhor_agente_B.npz --episodios 3 --max-passos 5000
 ```
 
-`--renderizar-melhor` abre a janela depois do treino; `--assistir` abre a janela
-diretamente com os pesos de um arquivo `.npz`. Se ainda nao houver um agente
-salvo, execute primeiro um dos comandos de treino acima. A janela pode ser
-fechada normalmente ao terminar o episodio.
+`--renderizar-melhor` abre a janela do jogo depois de cada treino e mostra o
+melhor agente encontrado naquele experimento. `--assistir` abre a janela
+diretamente usando os pesos de um arquivo `.npz`. Para assistir, o arquivo
+precisa existir; se ainda nao houver um agente salvo, execute primeiro um
+comando de treino. O comando de ajuda lista as opcoes disponiveis:
+
+```powershell
+python galaxian_neuroevolution.py --help
+```
+
+Os testes automatizados podem ser executados com:
+
+```powershell
+python -m unittest -v test_galaxian_neuroevolution.py
+```
 
 Opcoes: `--experimento A|B|C|all`, `--geracoes`, `--populacao`, `--seed`,
 `--max-passos`, `--saida`, `--renderizar-melhor`, `--assistir` e `--episodios`.
-Cada episodio e limitado a 5.000 passos por padrao para manter o custo de treino
-finito; altere o limite com `--max-passos`.
+Os valores padrao sao: experimento B, 30 geracoes, populacao de 20 individuos,
+semente 42, ate 5.000 passos por episodio e pasta de saida `resultados/`.
+Use `--seed` para repetir ou variar a semente, `--saida` para escolher outra
+pasta de resultados e `--max-passos` para alterar o limite de passos. Uma
+populacao maior, mais geracoes ou episodios mais longos aumentam o tempo de
+execucao.
 
 ## O que o programa implementa
 
