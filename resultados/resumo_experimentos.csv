@@ -1,0 +1,4 @@
+experimento,repeticoes,melhor_fitness_media,melhor_fitness_desvio_padrao,fitness_validacao_media,fitness_validacao_desvio_padrao,fitness_aleatorio_media,fitness_aleatorio_desvio_padrao,passos_validacao_media,passos_validacao_desvio_padrao,taxa_limite_validacao_media,taxa_limite_validacao_desvio_padrao
+A,5,2382.0,350.5082024717824,821.6,164.4549786415723,751.2,81.74692654773023,1059.24,347.1936036277166,0.0,0.0
+B,5,2574.0,233.20377355437455,935.2,135.53213641052074,751.2,81.74692654773023,937.1600000000001,147.83528130997684,0.0,0.0
+C,5,2488.0,347.9885055572957,950.0,143.13070949310634,751.2,81.74692654773023,883.24,123.73768383156361,0.0,0.0
